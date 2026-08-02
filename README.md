@@ -1,4 +1,5 @@
 Note: This is a submission for the 2025 Harvard & Duke LIVE AI Ivy Plus Hackathon.
+https://devpost.com/software/ticketchain-op65ls
 
 # 🎟️ Ticketchain
 Traditional ticketing systems suffer from scalping, counterfeit tickets, and excessive fees. Ticketchain is a blockchain-powered NFT ticketing system that eliminates these issues by ensuring secure, transparent, and fair transactions.
