@@ -6,8 +6,8 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 
 contract TicketNFT is ERC721URIStorage, Ownable {
     uint256 private _nextTokenId;
-    mapping(uint256 => uint256) public resalePrices; // Maximum allowed resale price for each ticket
-    mapping(uint256 => bool) public usedTickets;        // Marks tickets as used (validated)
+    mapping(uint256 => uint256) public resalePrices;
+    mapping(uint256 => bool) public usedTickets;
 
     event TicketMinted(address indexed owner, uint256 tokenId, string tokenURI);
     event TicketResold(uint256 tokenId, address indexed newOwner, uint256 price);
@@ -18,12 +18,18 @@ contract TicketNFT is ERC721URIStorage, Ownable {
         Ownable(initialOwner)
     {}
 
-    function mintTicket(address to, string memory tokenURI, uint256 maxResalePrice) external onlyOwner returns (uint256) {
+    function mintTicket(
+        address to,
+        string memory tokenURI,
+        uint256 maxResalePrice
+    ) external onlyOwner returns (uint256) {
         uint256 tokenId = _nextTokenId;
         _nextTokenId++;
+
         _mint(to, tokenId);
         _setTokenURI(tokenId, tokenURI);
         resalePrices[tokenId] = maxResalePrice;
+
         emit TicketMinted(to, tokenId, tokenURI);
         return tokenId;
     }
@@ -37,8 +43,14 @@ contract TicketNFT is ERC721URIStorage, Ownable {
         emit TicketResold(tokenId, newOwner, price);
     }
 
-    function validateTicket(uint256 tokenId) external {
-        require(ownerOf(tokenId) == msg.sender, "You do not own this ticket");
+    /// @notice Marks a ticket as consumed at event entry.
+    /// @dev Only the organizer/contract owner may validate tickets. Validation is one-time.
+    function validateTicket(uint256 tokenId) external onlyOwner {
+        // ownerOf also verifies that the token exists.
+        ownerOf(tokenId);
+        require(!usedTickets[tokenId], "Ticket already used");
+
+        usedTickets[tokenId] = true;
         emit TicketValidated(tokenId);
     }
 }
