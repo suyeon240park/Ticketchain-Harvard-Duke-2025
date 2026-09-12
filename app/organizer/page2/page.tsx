@@ -1,14 +1,17 @@
 'use client';
 
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { readQRFromFile } from '../../../hooks/qrcodeReader';
 import { Upload, CheckCircle, XCircle } from 'lucide-react';
 import { ethers } from 'ethers';
 
 const TICKET_NFT_ADDRESS = "0x67d269191c92Caf3cD7723F116c85e6E9bf55933";
+const HARDHAT_RPC_URL = "http://127.0.0.1:8545";
 
 const TICKET_NFT_ABI = [
   "function validateTicket(uint256 tokenId) external",
+  "function usedTickets(uint256 tokenId) external view returns (bool)",
+  "function ownerOf(uint256 tokenId) external view returns (address)",
 ];
 
 interface TicketData {
@@ -21,9 +24,9 @@ export default function OrganizerPage2() {
   const [ticketData, setTicketData] = useState<TicketData | null>(null);
   const [isValid, setIsValid] = useState<boolean | null>(null);
   const [status, setStatus] = useState<string>("");
+  const [organizerAddress, setOrganizerAddress] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropzoneRef = useRef<HTMLDivElement>(null);
-  const [userWallet, setUserWallet] = useState<string | null>(null);
 
   useEffect(() => {
     const urlParams = new URLSearchParams(window.location.search);
@@ -32,43 +35,50 @@ export default function OrganizerPage2() {
       setEvent(decodeURIComponent(eventName));
     }
 
-    const provider = new ethers.JsonRpcProvider("http://127.0.0.1:8545");
-    const PRIVATE_KEY = "0x59c6995e998f97a5a0044966f0945389dc9e86dae88c7a8412f4603b6b78690d";
-    const wallet = new ethers.Wallet(PRIVATE_KEY, provider);
-    setUserWallet(wallet.address);
-    const contract = new ethers.Contract(TICKET_NFT_ADDRESS, TICKET_NFT_ABI, wallet);
-    
+    const loadOrganizer = async () => {
+      try {
+        const provider = new ethers.JsonRpcProvider(HARDHAT_RPC_URL);
+        const signer = await provider.getSigner(0);
+        setOrganizerAddress(await signer.getAddress());
+      } catch (error) {
+        console.error("Unable to connect to local Hardhat organizer account:", error);
+        setStatus("Local blockchain is not available.");
+      }
+    };
+
+    loadOrganizer();
   }, []);
 
   const handleFileUpload = async (file: File) => {
-    if (!file) return;
+    setIsValid(null);
+    setTicketData(null);
+    setQrResult(null);
     setStatus("Reading QR code...");
+
     try {
       const result = await readQRFromFile(file);
-      setQrResult(result);
       if (!result) {
-        setStatus("No QR code found or QR code content is empty.");
-        setTicketData(null);
+        setStatus("No QR code was found in the selected image.");
         return;
       }
+
+      setQrResult(result);
+
       try {
-        // Attempt to parse as JSON
-        const parsed: TicketData = JSON.parse(result);
-        if (!parsed.tokenId) {
-          setStatus("QR code does not contain a valid ticket ID.");
-          setTicketData(null);
+        const parsed = JSON.parse(result) as Partial<TicketData>;
+        if (!Number.isInteger(parsed.tokenId) || (parsed.tokenId as number) < 0) {
+          setStatus("QR code does not contain a valid blockchain token ID.");
           return;
         }
-        setTicketData(parsed);
-        setStatus("QR code read successfully. Ready to validate.");
-      } catch (jsonError) {
-        console.error("Failed to parse QR code JSON:", jsonError);
-        setStatus("QR code content is recognized.");
-        setTicketData(null);
+
+        setTicketData({ tokenId: parsed.tokenId as number });
+        setStatus("QR code parsed. Ready to validate on-chain.");
+      } catch {
+        setStatus("QR code payload is not valid ticket JSON.");
       }
     } catch (error) {
       console.error("QR code read error:", error);
-      setStatus("Failed to read QR code.");
+      setStatus("Failed to read the QR code.");
     }
   };
 
@@ -78,34 +88,45 @@ export default function OrganizerPage2() {
   };
 
   const handleValidateTicket = async () => {
+    // Fail closed: never show a valid state unless a parsed token is confirmed on-chain.
     if (!ticketData) {
-      setStatus("Valid");
-      return;
-    }
-    if (!userWallet) {
-      setStatus("Please connect your wallet first.");
+      setIsValid(false);
+      setStatus("No valid ticket data is loaded.");
       return;
     }
 
     try {
-      setStatus("Connecting to blockchain...");
-      const provider = new ethers.JsonRpcProvider('http://localhost:8545');
-      const signer = await provider.getSigner();
-      const contract = new ethers.Contract(TICKET_NFT_ADDRESS, TICKET_NFT_ABI, signer);
+      setIsValid(null);
+      setStatus("Checking ticket on blockchain...");
 
-      // Step 1: Check if the user owns the ticket
+      const provider = new ethers.JsonRpcProvider(HARDHAT_RPC_URL);
+      const organizerSigner = await provider.getSigner(0);
+      const contract = new ethers.Contract(
+        TICKET_NFT_ADDRESS,
+        TICKET_NFT_ABI,
+        organizerSigner
+      );
 
-      // Step 2: Validate the ticket
-      setStatus("Validating ticket...");
+      // ownerOf verifies that the token exists. The contract itself enforces
+      // organizer-only validation and rejects already-used tickets.
+      await contract.ownerOf(ticketData.tokenId);
+      const alreadyUsed = await contract.usedTickets(ticketData.tokenId);
+      if (alreadyUsed) {
+        setIsValid(false);
+        setStatus("Ticket has already been used.");
+        return;
+      }
+
+      setStatus("Validating ticket on blockchain...");
       const tx = await contract.validateTicket(ticketData.tokenId);
-      setStatus("Transaction submitted. Waiting for confirmation...");
       await tx.wait();
-      setStatus("Ticket validated successfully!");
+
       setIsValid(true);
+      setStatus("Ticket validated successfully.");
     } catch (error: any) {
       console.error("Ticket validation error:", error);
-      setStatus("Ticket validation failed: " + error.message);
       setIsValid(false);
+      setStatus(`Ticket validation failed: ${error?.shortMessage ?? error?.message ?? "Unknown error"}`);
     }
   };
 
@@ -116,14 +137,12 @@ export default function OrganizerPage2() {
         {event ? (
           <h2 className="text-2xl font-semibold mb-6 text-gray-700">Event: {event}</h2>
         ) : (
-          <p className="text-gray-600">Loading...</p>
+          <p className="text-gray-600">No event selected.</p>
         )}
 
-        {userWallet ? (
-          <p className="text-gray-700">Connected Wallet: {userWallet}</p>
-        ) : (
-          <p className="text-red-600">Wallet not connected. Please connect.</p>
-        )}
+        <p className="text-gray-700">
+          Organizer wallet: {organizerAddress ?? "Not connected"}
+        </p>
 
         <div
           ref={dropzoneRef}
@@ -143,18 +162,18 @@ export default function OrganizerPage2() {
 
         {qrResult && (
           <div className="mt-6">
-            <p className="text-sm text-gray-600">QR Code Data: {qrResult}</p>
+            <p className="text-sm text-gray-600 break-all">QR Code Data: {qrResult}</p>
             {ticketData && (
               <div className="mt-4">
                 <p><strong>Token ID:</strong> {ticketData.tokenId}</p>
+                <button
+                  onClick={handleValidateTicket}
+                  className="mt-4 bg-blue-500 text-white px-4 py-2 rounded"
+                >
+                  Validate Ticket on Blockchain
+                </button>
               </div>
             )}
-            <button
-              onClick={handleValidateTicket}
-              className="mt-4 bg-blue-500 text-white px-4 py-2 rounded"
-            >
-              Validate Ticket on Blockchain
-            </button>
           </div>
         )}
 
