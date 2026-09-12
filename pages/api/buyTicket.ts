@@ -1,11 +1,14 @@
 import { NextApiRequest, NextApiResponse } from "next";
-import { ethers, Contract, JsonRpcProvider } from "ethers";
-import TicketNFTArtifact from "../../ticket-contracts/artifacts/contracts/TicketNFT.sol/TicketNFT.json";
+import { Contract, JsonRpcProvider, ethers } from "ethers";
 import clientPromise from "../../lib/mongodb";
-import dotenv from "dotenv";
 import { ObjectId } from "mongodb";
 
-dotenv.config();
+const TICKET_NFT_ABI = [
+  "function mintTicket(address to, string tokenURI, uint256 maxResalePrice) external returns (uint256)",
+  "event TicketMinted(address indexed owner, uint256 tokenId, string tokenURI)",
+];
+
+const HARDHAT_RPC_URL = "http://127.0.0.1:8545";
 
 export default async function handler(req: NextApiRequest, res: NextApiResponse) {
   try {
@@ -14,137 +17,100 @@ export default async function handler(req: NextApiRequest, res: NextApiResponse)
     }
 
     const { userId, eventId } = req.body;
-    
-    // Step 1: Validate Input Data
     if (!userId || !eventId) {
-      console.error("Error: Missing userId or eventId.");
-      return res.status(400).json({ error: "Invalid request. userId and eventId are required." });
+      return res.status(400).json({ error: "userId and eventId are required." });
     }
-    console.log(`Received userId: ${userId}, eventId: ${eventId}`);
 
-    // Step 2: Validate Environment Variables
     const contractAddress = process.env.CONTRACT_ADDRESS;
-    const organizerPrivateKey = process.env.ORGANIZER_PRIVATE_KEY;
-    const customerPrivateKey = process.env.CUSTOMER_PRIVATE_KEY;
-    if (!contractAddress || !organizerPrivateKey || !customerPrivateKey) {
-      console.error("Error: Missing blockchain environment variables.");
-      return res.status(500).json({ error: "Blockchain configuration error. Required keys are missing." });
+    if (!contractAddress) {
+      return res.status(500).json({ error: "CONTRACT_ADDRESS is not configured." });
     }
 
-    // Step 3: Connect to MongoDB
-    let client;
-    try {
-      client = await clientPromise;
-    } catch (err) {
-      console.error("MongoDB connection failed:", err);
-      return res.status(500).json({ error: "Database connection error." });
-    }
+    const client = await clientPromise;
     const eventDb = client.db("eventinfo");
     const eventsCollection = eventDb.collection("events");
     const userDb = client.db("userinfo");
     const ticketsCollection = userDb.collection("tickets");
 
-    // Step 4: Fetch Event Details
     const eventInfo = await eventsCollection.findOne({ _id: new ObjectId(eventId) });
     if (!eventInfo) {
       return res.status(404).json({ error: `Event with ID ${eventId} not found.` });
     }
-    console.log("Event details:", eventInfo);
 
-    // Step 5: Connect to Blockchain
-    let provider, organizerWallet, customerWallet, ticketContract;
-    try {
-      provider = new JsonRpcProvider("http://localhost:8545");
-      organizerWallet = new ethers.Wallet(organizerPrivateKey, provider);
-      customerWallet = new ethers.Wallet(customerPrivateKey, provider);
-      ticketContract = new Contract(contractAddress, TicketNFTArtifact.abi, organizerWallet);
-    } catch (err) {
-      console.error("Blockchain connection failed:", err);
-      return res.status(500).json({ error: "Failed to connect to blockchain." });
-    }
+    // This hackathon prototype runs against a local Hardhat node. The node exposes
+    // unlocked development accounts, so no private keys need to be stored in the app.
+    const provider = new JsonRpcProvider(HARDHAT_RPC_URL);
+    const organizerSigner = await provider.getSigner(0);
+    const customerSigner = await provider.getSigner(1);
+    const customerAddress = await customerSigner.getAddress();
+    const organizerAddress = await organizerSigner.getAddress();
+    const ticketContract = new Contract(contractAddress, TICKET_NFT_ABI, organizerSigner);
 
-    // Step 6: Convert Prices to ETH
-    let ticketPriceInEth, maxResalePriceInEth;
-    try {
-      // In this example, we convert using a divisor (e.g. 2000). Adjust as needed.
-      ticketPriceInEth = ethers.parseEther((eventInfo.price / 2000).toString());
-      maxResalePriceInEth = ethers.parseEther((eventInfo.maxResaleCap / 2000).toString());
-    } catch (err) {
-      console.error("Price conversion failed:", err);
-      return res.status(500).json({ error: "Error converting prices to ETH." });
-    }
-
-    // Step 7: Mint NFT Ticket
-    console.log("Minting NFT Ticket...");
+    const ticketPriceInEth = ethers.parseEther((eventInfo.price / 2000).toString());
+    const maxResalePriceInEth = ethers.parseEther((eventInfo.maxResaleCap / 2000).toString());
     const tokenURI = ethers.keccak256(ethers.toUtf8Bytes(eventId));
-    let mintReceipt;
-    try {
-      const mintTx = await ticketContract.mintTicket(customerWallet.address, tokenURI, maxResalePriceInEth);
-      mintReceipt = await mintTx.wait();
-      if (!mintReceipt || !mintReceipt.hash) {
-        throw new Error("NFT Minting failed. No transaction hash returned.");
-      }
-      console.log(`NFT Minted! Transaction Hash: ${mintReceipt.hash}`);
-    } catch (err) {
-      console.error("Minting failed:", err);
-      return res.status(500).json({ error: "Blockchain minting transaction failed." });
+
+    const mintTx = await ticketContract.mintTicket(
+      customerAddress,
+      tokenURI,
+      maxResalePriceInEth
+    );
+    const mintReceipt = await mintTx.wait();
+    if (!mintReceipt) {
+      throw new Error("NFT minting transaction was not confirmed.");
     }
 
-    // Step 8: Process Payment Transaction
-    console.log("Processing payment transaction...");
-    let paymentReceipt;
-    try {
-      const paymentTx = await customerWallet.sendTransaction({
-        to: organizerWallet.address,
-        value: ticketPriceInEth,
-      });
-      console.log("Waiting for payment transaction confirmation...");
-      paymentReceipt = await paymentTx.wait();
-      if (!paymentReceipt || !paymentReceipt.hash) {
-        throw new Error("Payment transaction failed. No transaction hash returned.");
-      }
-      console.log(`Payment Successful! Transaction Hash: ${paymentReceipt.hash}`);
-    } catch (err) {
-      console.error("Payment failed:", err);
-      return res.status(500).json({ error: "Payment transfer failed." });
+    const ticketMintedLog = mintReceipt.logs
+      .map((log) => {
+        try {
+          return ticketContract.interface.parseLog(log);
+        } catch {
+          return null;
+        }
+      })
+      .find((log) => log?.name === "TicketMinted");
+
+    if (!ticketMintedLog) {
+      throw new Error("TicketMinted event was not found in the mint receipt.");
     }
 
-    // Step 9: Store Ticket in MongoDB
+    const tokenId = Number(ticketMintedLog.args.tokenId);
+
+    const paymentTx = await customerSigner.sendTransaction({
+      to: organizerAddress,
+      value: ticketPriceInEth,
+    });
+    const paymentReceipt = await paymentTx.wait();
+    if (!paymentReceipt) {
+      throw new Error("Payment transaction was not confirmed.");
+    }
+
+    const userObjectId = new ObjectId(userId);
+    const existingUser = await ticketsCollection.findOne({ _id: userObjectId });
+    if (!existingUser) {
+      return res.status(404).json({ error: `Customer with ID ${userId} was not found.` });
+    }
+
     const mongoTicket = {
-      tokenURI: tokenURI,
-      eventId: eventId,
+      tokenId,
+      tokenURI,
+      eventId,
     };
-    
-    try {
-      const userObjectId = new ObjectId(userId); // Convert if necessary
-      const existingUser = await ticketsCollection.findOne({ _id: userObjectId });
-    
-      if (!existingUser) {
-        return res.status(500).json({ error: `Customer with ${userId} doesn't exist in DB.` });
-      }
-    
-      // Update query with correct type
-      const result = await ticketsCollection.updateOne(
-        { _id: userObjectId },
-        { $push: { tickets: mongoTicket as any } },
-        { upsert: true }
-      );
-    
-      res.status(200).json({ success: true, result });
-    } catch (err) {
-      console.error("MongoDB ticket storage failed:", err);
-      return res.status(500).json({ error: "Failed to store ticket in database." });
-    }
 
-    return res.status(200).json({ 
-      success: true, 
-      tokenURI, 
-      mintTransactionHash: mintReceipt.hash, 
-      paymentTransactionHash: paymentReceipt.hash 
+    await ticketsCollection.updateOne(
+      { _id: userObjectId },
+      { $push: { tickets: mongoTicket as any } }
+    );
+
+    return res.status(200).json({
+      success: true,
+      tokenId,
+      tokenURI,
+      mintTransactionHash: mintReceipt.hash,
+      paymentTransactionHash: paymentReceipt.hash,
     });
   } catch (error) {
-    console.error("Unexpected error:", error);
-    return res.status(500).json({ error: "Internal server error." });
+    console.error("Ticket purchase failed:", error);
+    return res.status(500).json({ error: "Ticket purchase failed." });
   }
 }
-
